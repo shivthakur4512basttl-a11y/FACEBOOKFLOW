@@ -1,21 +1,20 @@
 import streamlit as st
 import os
 import requests
-import urllib.parse
+import time
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-import time
 
 load_dotenv()
 
-# --- 1. Configuration ---
+# --- CONFIG ---------------------------------------------------------------------
 INSTA_APP_ID = os.getenv("INSTA_APP_ID")
 INSTA_APP_SECRET = os.getenv("INSTA_APP_SECRET")
 EMBED_URL = os.getenv("INSTA_EMBED_URL")
 API_VERSION = "v24.0"
 INSTA_REDIRECT_URI = "https://facebookflowbasttl.streamlit.app/redirect"
 
-# --- UTILITIES ---------------------------------------------------------------------------------
+# --- HELPERS ---------------------------------------------------------------------
 def parse_ts(ts: str):
     return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z").astimezone(timezone.utc)
 
@@ -28,17 +27,52 @@ def metric_value_from_insights(media_item: dict, metric_name: str) -> int:
             return int(m.get("value", 0) or 0)
     return 0
 
-# --- FETCH MEDIA STATS (INTEGRATED FUNCTIONALITY) -----------------------------------------------
+# --- METRICS FUNCTION (FOR 7/30/90 DAY ENGAGEMENT) --------------------------------
+def fetch_instagram_metrics(access_token, ig_user_id, days, followers):
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
+    fields = "id,timestamp,like_count,comments_count,insights.metric(views,impressions,reach,saved,shares,total_interactions)"
+    url = f"https://graph.instagram.com/{API_VERSION}/{ig_user_id}/media?fields={fields}&limit=50&access_token={access_token}"
+
+    totals = {"likes": 0, "comments": 0, "shares": 0, "saves": 0, "reach": 0, "total_interactions": 0, "post_count": 0}
+
+    while url:
+        resp = requests.get(url, timeout=10).json()
+        if "data" not in resp: break
+
+        for post in resp['data']:
+            post_date = datetime.strptime(post['timestamp'], "%Y-%m-%dT%H:%M:%S%z")
+            if post_date < cutoff_date:
+                url = None
+                break
+
+            totals["likes"] += post.get('like_count', 0)
+            totals["comments"] += post.get('comments_count', 0)
+            totals["post_count"] += 1
+
+            if 'insights' in post:
+                for metric in post['insights']['data']:
+                    val = metric['values'][0]['value'] if metric['values'] else 0
+                    name = metric['name']
+                    if name == 'shares': totals["shares"] += val
+                    elif name == 'saved': totals["saves"] += val
+                    elif name == 'reach': totals["reach"] += val
+                    elif name == 'total_interactions': totals["total_interactions"] += val
+
+        url = resp.get('paging', {}).get('next')
+
+    engagement = totals["likes"] + totals["comments"] + totals["shares"] + totals["saves"]
+    er = (engagement / followers * 100) if followers > 0 else 0
+    return {"ER": round(er, 2), "posts": totals["post_count"], "totals": totals}
+
+# --- MEDIA TOTALS (FOR VIEWS/SHARES/SAVED) ----------------------------------------
 def fetch_media_totals(access_token, ig_user_id, days=90):
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=days)
 
-    # Get media_count
+    # STEP 1: get media_count
     media_res = requests.get(
         f"https://graph.instagram.com/{API_VERSION}/{ig_user_id}?fields=media_count&access_token={access_token}"
     ).json()
-
     media_count = media_res.get("media_count", 100)
-    print(f"[TERMINAL] Media Count from API = {media_count}")
 
     BASE_URL = (
         f"https://graph.instagram.com/{API_VERSION}/{ig_user_id}/media?"
@@ -82,79 +116,114 @@ def fetch_media_totals(access_token, ig_user_id, days=90):
 
     return totals
 
-# --- 3. Streamlit UI ----------------------------------------------------------------------------
-st.set_page_config(page_title="Instagram Pro Insights", page_icon="📊", layout="wide")
-st.title("📊 Instagram Business Data Automator")
+# --- STREAMLIT UI -----------------------------------------------------------------
+st.set_page_config(page_title="Instagram Professional Insights", page_icon="📊", layout="wide")
+st.title("📊 Instagram Professional Insights Suite")
 
 query_params = st.query_params
 
-if "code" in query_params:
-
-    auth_code = query_params["code"].split("#_")[0]
-    print(f"\n[!] NEW AUTH CODE RECEIVED: {auth_code[:15]}...")
-
-    with st.status("🔗 Connecting to Instagram & Fetching Data...", expanded=True) as status:
-
-        # Exchange Code → Short Token
-        token_url = "https://api.instagram.com/oauth/access_token"
-        payload = {
-            "client_id": INSTA_APP_ID,
-            "client_secret": INSTA_APP_SECRET,
-            "grant_type": "authorization_code",
-            "redirect_uri": INSTA_REDIRECT_URI,
-            "code": auth_code
-        }
-        token_res = requests.post(token_url, data=payload).json()
-        short_token = token_res.get("access_token")
-
-        if not short_token:
-            st.error("❌ Token exchange failed.")
-            st.write(token_res)
-            st.stop()
-
-        # Upgrade → Long Token
-        ll_url = "https://graph.instagram.com/access_token"
-        ll_params = {
-            "grant_type": "ig_exchange_token",
-            "client_secret": INSTA_APP_SECRET,
-            "access_token": short_token
-        }
-        ll_res = requests.get(ll_url, params=ll_params).json()
-        access_token = ll_res.get("access_token")
-
-        # Profile Info
-        me_url = f"https://graph.instagram.com/{API_VERSION}/me?fields=user_id,username,name,followers_count,profile_picture_url&access_token={access_token}"
-        user = requests.get(me_url).json()
-
-        user_id = user.get("user_id")
-        username = user.get("username")
-        name = user.get("name", "Instagram User")
-        followers = user.get("followers_count", 0)
-        profile_pic = user.get("profile_picture_url")
-
-        # --- NEW: FETCH FULL MEDIA TOTALS ----------------------------------------------------------
-        st.write("📸 Fetching 90-Day Media Insights...")
-        media_totals = fetch_media_totals(access_token, user_id, days=90)
-
-        status.update(label="✅ Success! Data Processed.", state="complete")
-
-        st.divider()
-
-        # UI: Profile Header
-        c1, c2 = st.columns([1,4])
-        with c1:
-            st.image(profile_pic, width=120) if profile_pic else st.write("👤 No Profile Image")
-        with c2:
-            st.subheader(f"{name} (@{username})")
-            st.write(f"**Followers:** {followers:,}")
-            st.write(f"**User ID:** `{user_id}`")
-
-        st.divider()
-
-        # UI: 90-Day Media Totals
-        st.markdown("### 🧾 90-Day Media Performance Totals")
-        st.json(media_totals)
-
-else:
-    st.info("👋 Welcome! Please authorize your Instagram account.")
+if "code" not in query_params:
+    st.info("👋 Please authorize your Instagram account to begin.")
     st.link_button("🚀 Login & Authorize Instagram", url=EMBED_URL, use_container_width=True)
+    st.stop()
+
+auth_code = query_params["code"].split("#_")[0]
+
+with st.status("🔗 Connecting to Instagram...", expanded=True) as status:
+
+    # STEP 1: Exchange short token
+    token_url = "https://api.instagram.com/oauth/access_token"
+    payload = {
+        "client_id": INSTA_APP_ID,
+        "client_secret": INSTA_APP_SECRET,
+        "grant_type": "authorization_code",
+        "redirect_uri": INSTA_REDIRECT_URI,
+        "code": auth_code
+    }
+    token_res = requests.post(token_url, data=payload).json()
+    short_token = token_res.get("access_token")
+
+    if not short_token:
+        st.error("❌ Token exchange failed")
+        st.write(token_res)
+        st.stop()
+
+    # STEP 2: Upgrade to long-lived token
+    ll_url = "https://graph.instagram.com/access_token"
+    ll_params = {
+        "grant_type": "ig_exchange_token",
+        "client_secret": INSTA_APP_SECRET,
+        "access_token": short_token
+    }
+    ll_res = requests.get(ll_url, params=ll_params).json()
+    access_token = ll_res.get("access_token")
+
+    # STEP 3: Fetch base profile fields
+    me_url = (
+        f"https://graph.instagram.com/{API_VERSION}/me"
+        f"?fields=id,user_id,username,name"
+        f"&access_token={access_token}"
+    )
+    me_data = requests.get(me_url).json()
+    app_id = me_data.get("id")
+    ig_user_id = me_data.get("user_id")
+    username = me_data.get("username")
+    name = me_data.get("name")
+
+    # STEP 4: Fetch professional account fields
+    prof_url = (
+        f"https://graph.instagram.com/{API_VERSION}/{ig_user_id}"
+        f"?fields=account_type,profile_picture_url,followers_count,follows_count,media_count"
+        f"&access_token={access_token}"
+    )
+    prof_data = requests.get(prof_url).json()
+
+    account_type = prof_data.get("account_type")
+    profile_pic = prof_data.get("profile_picture_url")
+    followers = prof_data.get("followers_count", 0)
+    follows = prof_data.get("follows_count", 0)
+    media_count = prof_data.get("media_count", 0)
+
+    # STEP 5: 7/30/90 day metrics (unchanged)
+    st.write("📊 Fetching 7/30/90 Day Engagement Metrics...")
+    report_7 = fetch_instagram_metrics(access_token, ig_user_id, 7, followers)
+    report_30 = fetch_instagram_metrics(access_token, ig_user_id, 30, followers)
+    report_90 = fetch_instagram_metrics(access_token, ig_user_id, 90, followers)
+
+    # STEP 6: 90-day media totals
+    st.write("📸 Fetching 90-Day Media Totals...")
+    media_totals = fetch_media_totals(access_token, ig_user_id, 90)
+
+    status.update(label="✅ Data Loaded Successfully!", state="complete")
+
+# --- DISPLAY UI -------------------------------------------------------------------
+
+# PROFILE HEADER
+col1, col2 = st.columns([1,4])
+with col1:
+    st.image(profile_pic, width=120) if profile_pic else st.write("👤 No Profile Image")
+with col2:
+    st.subheader(f"{name} (@{username})")
+    st.write(f"**Account Type:** {account_type}")
+    st.write(f"**Followers:** {followers:,}")
+    st.write(f"**Following:** {follows:,}")
+    st.write(f"**Media Count:** {media_count:,}")
+    st.write(f"**App Scoped ID:** `{app_id}`")
+    st.write(f"**IG User ID:** `{ig_user_id}`")
+
+st.divider()
+
+# METRICS
+st.markdown("### 📈 Engagement Performance")
+m1, m2, m3 = st.columns(3)
+m1.metric("7-Day ER", f"{report_7['ER']}%", f"{report_7['posts']} posts")
+m2.metric("30-Day ER", f"{report_30['ER']}%", f"{report_30['posts']} posts")
+m3.metric("90-Day ER", f"{report_90['ER']}%", f"{report_90['posts']} posts")
+
+st.divider()
+
+# MEDIA TOTALS
+st.markdown("### 🧾 90-Day Media Totals")
+st.json(media_totals)
+
+st.success("🎉 All Data Loaded Successfully!")
